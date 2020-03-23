@@ -252,7 +252,12 @@ static int hdimage_insert_gpt(struct image *image, struct list_head *partitions)
 	unsigned i, j;
 	int ret;
 
-	image_info(image, "writing GPT\n");
+	char mbr[6+4*sizeof(struct mbr_partition_entry)+2], *part_table;
+	int hybrid = 0;
+
+	memset(mbr, 0, sizeof(mbr));
+	memcpy(mbr, &hd->disksig, sizeof(hd->disksig));
+	part_table = mbr + 6;
 
 	memset(&header, 0, sizeof(struct gpt_header));
 	memcpy(header.signature, "EFI PART", 8);
@@ -282,8 +287,59 @@ static int hdimage_insert_gpt(struct image *image, struct list_head *partitions)
 		table[i].flags = part->bootable ? GPT_PE_FLAG_BOOTABLE : 0;
 		for (j = 0; j < strlen(part->name) && j < 36; j++)
 			table[i].name[j] = htole16(part->name[j]);
+
+		if (part->partition_type) {
+			struct mbr_partition_entry *entry;
+
+			entry = (struct mbr_partition_entry *)(part_table + i *
+				sizeof(struct mbr_partition_entry));
+
+			entry->boot = part->bootable ? 0x80 : 0x00;
+
+			entry->partition_type = part->partition_type;
+			entry->relative_sectors = part->offset/512;
+			entry->total_sectors = part->size/512;
+
+			hdimage_setup_chs(entry->relative_sectors, entry->first_chs);
+			hdimage_setup_chs(entry->relative_sectors +
+			entry->total_sectors - 1, entry->last_chs);
+
+			hybrid++;
+		}
 		i++;
 	}
+
+	if (hybrid) {
+		struct mbr_partition_entry *entry;
+
+		entry = (struct mbr_partition_entry *)(part_table + i *
+			sizeof(struct mbr_partition_entry));
+
+		entry->boot = 0x00;
+
+		entry->partition_type = 0xee;
+		entry->relative_sectors = 1;
+		entry->total_sectors = (512+sizeof(header)+sizeof(table))/512;
+
+		hdimage_setup_chs(entry->relative_sectors, entry->first_chs);
+		hdimage_setup_chs(entry->relative_sectors +
+		entry->total_sectors - 1, entry->last_chs);
+
+		image_info(image, "writing Hybrid MBR\n");
+
+		part_table += 4 * sizeof(struct mbr_partition_entry);
+		part_table[0] = 0x55;
+		part_table[1] = 0xaa;
+
+		ret = insert_data(image, mbr, imageoutfile(image), sizeof(mbr), 440);
+		if (ret) {
+			image_error(image, "failed to write Hybrid MBR\n");
+			return ret;
+		}
+	}
+
+	image_info(image, "writing GPT\n");
+
 	header.table_crc = htole32(crc32(table, sizeof(table)));
 
 	header.header_crc = htole32(crc32(&header, sizeof(header)));
@@ -323,7 +379,8 @@ static int hdimage_insert_gpt(struct image *image, struct list_head *partitions)
 		return ret;
 	}
 
-	ret = hdimage_insert_protective_mbr(image);
+	if (!hybrid)
+		ret = hdimage_insert_protective_mbr(image);
 	if (ret) {
 		return ret;
 	}
